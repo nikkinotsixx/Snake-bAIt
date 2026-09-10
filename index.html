@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
-    <title>Snake bAIt</title>
+    <title>Snake bAIt — optimized</title>
     <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -38,6 +38,14 @@
             transform: translate3d(calc(var(--px,0px) * -.35), calc(var(--py,0px) * -.35), 0);
         }
         #startScreen, #gameScreen, #leaderboardScreen, #pauseScreen, #gameOverScreen { isolation: isolate; }
+
+        /* PERFORMANCE: avoid browser gestures/layout work over the game surface. */
+        html, body { width:100%; height:100%; max-width:100%; overscroll-behavior:none; }
+        #gameCanvas { touch-action:none; display:block; contain:layout paint; }
+        #bgOverlay, #bgFrame { will-change:transform; }
+        @media (prefers-reduced-motion: reduce) {
+            #bgOverlay, #bgFrame { transition:none; }
+        }
 
         /* START SCREEN */
         #startScreen {
@@ -1052,7 +1060,19 @@
         let speedMultiplier = 1.0;      // задаётся сложностью: лёгко x1, нормально x1.5, сложно x2
         let selectedSensitivity = 5;    // 1..10 — чувствительность свайпа
         let bestBtc = 0, colorFlash = 0, levelFlashStart = 0, shieldFlash = 0;
-        let gameTickTimeout = null, scoreSubmitted = false;
+        let gameFrameId = null;
+        let gameLoopRunning = false;
+        let gameAccumulator = 0;
+        let lastGameFrameTime = 0;
+        let lastRenderTime = 0;
+        let scoreSubmitted = false;
+        let boostUiTimer = null;
+        let bgTimer = null;
+        let bgLastTime = 0;
+        let gamepadTimer = null;
+        const MAX_RENDER_FPS = 30;
+        const MAX_FRAME_DELTA = 100;
+        const MAX_CATCHUP_STEPS = 3;
         let activeBoosts = { ruby: null, emerald: null };
         let activePowerups = { slow: null, shield: false }; // новые бонусы
         let nextBoostSpawnTime = 0;
@@ -1066,6 +1086,21 @@
         let telegramUser = null;
         let telegramInitData = '';
 
+
+        // ==================== PERFORMANCE CACHE ====================
+        const hudEls = {
+            btc: document.getElementById('btcScore'),
+            usd: document.getElementById('usdScore'),
+            best: document.getElementById('bestScore'),
+            speed: document.getElementById('speedDisp'),
+            level: document.getElementById('levelName'),
+            progress: document.getElementById('progressFill'),
+            boosts: document.getElementById('boostIndicators')
+        };
+        let lastHudBtc = '', lastHudUsd = '', lastHudBest = '', lastHudSpeed = '';
+        let gridCacheCanvas = null;
+        let gridCacheKey = '';
+        let renderRequested = true;
 
         // ==================== ФОН ====================
         let bgStars = [], bgOffset = 0, bgMountainOffset = 0;
@@ -1082,15 +1117,16 @@
             }
         }
 
-        function drawBackground() {
+        function drawBackground(dtMs = 50) {
             const W = bgCanvas.width, H = bgCanvas.height, horizonY = H * 0.55;
+            const frameScale = Math.min(2, Math.max(0, dtMs) / 50);
             const skyGrad = bgCtx.createLinearGradient(0, 0, 0, horizonY);
             skyGrad.addColorStop(0, '#0d0020'); skyGrad.addColorStop(0.3, '#2d004d');
             skyGrad.addColorStop(0.6, '#ff0066'); skyGrad.addColorStop(0.85, '#ff6600'); skyGrad.addColorStop(1, '#ffcc00');
             bgCtx.fillStyle = skyGrad; bgCtx.fillRect(0, 0, W, horizonY);
 
             bgStars.forEach(s => {
-                s.twinkle += s.speed * 16;
+                s.twinkle += s.speed * 16 * frameScale;
                 const a = (Math.sin(s.twinkle) + 1) / 2 * 0.8 + 0.2;
                 bgCtx.fillStyle = 'rgba(255,255,255,' + a + ')';
                 bgCtx.fillRect(s.x * W, s.y * horizonY, s.size, s.size);
@@ -1109,7 +1145,7 @@
                 bgCtx.fillRect(sunCX - hw, stripeY, hw * 2, stripeH);
             }
 
-            bgMountainOffset += 0.3;
+            bgMountainOffset += 0.3 * frameScale;
             bgCtx.fillStyle = '#1a0033'; bgCtx.beginPath(); bgCtx.moveTo(0, horizonY);
             for (let x = 0; x <= W; x += 20) {
                 const wx = (x + bgMountainOffset) * 0.01;
@@ -1128,7 +1164,7 @@
             bgCtx.stroke(); bgCtx.shadowBlur = 0;
 
             bgCtx.fillStyle = '#0a0015'; bgCtx.fillRect(0, horizonY, W, H - horizonY);
-            bgOffset += 1.5;
+            bgOffset += 1.5 * frameScale;
             const vpX = W / 2, floorH = H - horizonY;
             bgCtx.lineWidth = 1;
             for (let i = -20; i <= 20; i++) {
@@ -1145,18 +1181,49 @@
             }
         }
 
-        function resizeBgCanvas() { bgCanvas.width = window.innerWidth; bgCanvas.height = window.innerHeight; }
-        function bgLoop() { drawBackground(); requestAnimationFrame(bgLoop); }
+        function resizeBgCanvas() {
+            const w = Math.max(1, Math.floor(window.innerWidth));
+            const h = Math.max(1, Math.floor(window.innerHeight));
+            if (bgCanvas.width !== w || bgCanvas.height !== h) {
+                bgCanvas.width = w;
+                bgCanvas.height = h;
+                renderBackgroundNow();
+            }
+        }
+        function renderBackgroundNow() {
+            const now = performance.now();
+            const dt = bgLastTime ? Math.min(100, now - bgLastTime) : 50;
+            bgLastTime = now;
+            drawBackground(dt);
+        }
+        function stopBackgroundLoop() {
+            if (bgTimer !== null) { clearTimeout(bgTimer); bgTimer = null; }
+        }
+        function scheduleBackgroundLoop() {
+            stopBackgroundLoop();
+            const tick = () => {
+                bgTimer = null;
+                if (document.hidden) return;
+                renderBackgroundNow();
+                bgTimer = setTimeout(tick, 50); // 20 FPS is enough for the distant animated scene
+            };
+            bgTimer = setTimeout(tick, 50);
+        }
 
         // ==================== ФОНОВЫЙ ПАРАЛЛАКС ====================
-        let parallaxX = 0, parallaxY = 0;
+        let parallaxX = 0, parallaxY = 0, parallaxQueued = false;
         function setParallax(clientX, clientY) {
             const nx = (clientX / Math.max(1, window.innerWidth) - 0.5);
             const ny = (clientY / Math.max(1, window.innerHeight) - 0.5);
             parallaxX = nx * 18;
             parallaxY = ny * 14;
-            document.documentElement.style.setProperty('--px', parallaxX.toFixed(1) + 'px');
-            document.documentElement.style.setProperty('--py', parallaxY.toFixed(1) + 'px');
+            if (parallaxQueued) return;
+            parallaxQueued = true;
+            requestAnimationFrame(() => {
+                parallaxQueued = false;
+                document.documentElement.style.setProperty('--px', parallaxX.toFixed(1) + 'px');
+                document.documentElement.style.setProperty('--py', parallaxY.toFixed(1) + 'px');
+            });
         }
         window.addEventListener('pointermove', e => {
             if (e.pointerType !== 'touch') setParallax(e.clientX, e.clientY);
@@ -1315,7 +1382,7 @@
             // Применяем выбранный размер поля: canvas остаётся физически
             // ~700px (см. CSS #gameCanvas), меняется только число клеток.
             COLS = selectedGridSize; ROWS = selectedGridSize;
-            canvas.width = COLS * GRID; canvas.height = ROWS * GRID;
+            canvas.width = COLS * GRID; canvas.height = ROWS * GRID; invalidateGridCache();
             const cx = Math.floor(COLS / 2), cy = Math.floor(ROWS / 2);
             snake = [{x:cx,y:cy},{x:cx-1,y:cy},{x:cx-2,y:cy}];
             dir = {x:1,y:0}; nextDir = {x:1,y:0};
@@ -1457,12 +1524,16 @@
         // ==================== HUD ====================
         function updateHUD() {
             const s = score || 0;
-            document.getElementById('btcScore').innerText = s.toFixed(2);
-            document.getElementById('usdScore').innerText = '$' + Math.floor(s * BTC_USD).toLocaleString('en-US');
-            document.getElementById('bestScore').innerText = '$' + Math.floor((bestBtc||0) * BTC_USD).toLocaleString('en-US');
+            const btc = s.toFixed(2);
+            const usd = '$' + Math.floor(s * BTC_USD).toLocaleString('en-US');
+            const best = '$' + Math.floor((bestBtc || 0) * BTC_USD).toLocaleString('en-US');
             const base = DIFFICULTIES[selectedDifficulty].baseFps;
             const mult = (currentFps || base) / base;
-            document.getElementById('speedDisp').innerText = 'x' + mult.toFixed(1);
+            const speed = 'x' + mult.toFixed(1);
+            if (hudEls.btc && btc !== lastHudBtc) { hudEls.btc.innerText = btc; lastHudBtc = btc; }
+            if (hudEls.usd && usd !== lastHudUsd) { hudEls.usd.innerText = usd; lastHudUsd = usd; }
+            if (hudEls.best && best !== lastHudBest) { hudEls.best.innerText = best; lastHudBest = best; }
+            if (hudEls.speed && speed !== lastHudSpeed) { hudEls.speed.innerText = speed; lastHudSpeed = speed; }
         }
 
         function updateLevelBar() {
@@ -1483,7 +1554,7 @@
         }
 
         function updateBoostIndicators() {
-            const c = document.getElementById('boostIndicators');
+            const c = hudEls.boosts || document.getElementById('boostIndicators');
             let html = '';
             if (activeBoosts.ruby) {
                 const rem = Math.max(0, (activeBoosts.ruby - Date.now()) / 1000);
@@ -1515,6 +1586,20 @@
             c.innerHTML = html;
         }
 
+        function stopBoostUiLoop() {
+            if (boostUiTimer !== null) { clearTimeout(boostUiTimer); boostUiTimer = null; }
+        }
+        function startBoostUiLoop() {
+            stopBoostUiLoop();
+            const tick = () => {
+                boostUiTimer = null;
+                if (gameState !== GAME_STATE.PLAYING) return;
+                updateBoostIndicators();
+                boostUiTimer = setTimeout(tick, 100);
+            };
+            tick();
+        }
+
         // ==================== ИГРОВОЙ ЦИКЛ ====================
         function shieldSaves() {
             // Щит спасает от одного столкновения (стена/хвост/препятствие).
@@ -1527,8 +1612,8 @@
             return true;
         }
 
-        function gameTick() {
-            if (!gameRunning || paused) return;
+        function updateGame() {
+            if (gameState !== GAME_STATE.PLAYING || !gameRunning || paused) return false;
             dir = nextDir;
             const head = {x: snake[0].x + dir.x, y: snake[0].y + dir.y};
 
@@ -1537,19 +1622,15 @@
                 if (head.x >= COLS) head.x = 0;
                 if (head.y < 0) head.y = ROWS - 1;
                 if (head.y >= ROWS) head.y = 0;
-            } else {
-                if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) {
-                    if (shieldSaves()) { render(); gameTickTimeout = setTimeout(gameTick, 1000 / effectiveFps(currentFps)); return; }
-                    sfxDie(); collisionVibe();
-                    gameOver(); return;
-                }
+            } else if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) {
+                if (shieldSaves()) { renderRequested = true; return true; }
+                sfxDie(); collisionVibe(); gameOver(); return false;
             }
 
             for (let i = 0; i < snake.length - 1; i++) {
                 if (snake[i].x === head.x && snake[i].y === head.y) {
-                    if (shieldSaves()) { render(); gameTickTimeout = setTimeout(gameTick, 1000 / effectiveFps(currentFps)); return; }
-                    sfxDie(); collisionVibe();
-                    gameOver(); return;
+                    if (shieldSaves()) { renderRequested = true; return true; }
+                    sfxDie(); collisionVibe(); gameOver(); return false;
                 }
             }
 
@@ -1557,62 +1638,44 @@
                 if (activeBoosts.emerald && Date.now() < activeBoosts.emerald) {
                     obstaclePassFlash = 8;
                 } else if (shieldSaves()) {
-                    render(); gameTickTimeout = setTimeout(gameTick, 1000 / effectiveFps(currentFps)); return;
+                    renderRequested = true; return true;
                 } else {
-                    sfxDie(); collisionVibe();
-                    gameOver(); return;
+                    sfxDie(); collisionVibe(); gameOver(); return false;
                 }
             }
 
             snake.unshift(head);
-
             let ate = false;
             for (let i = btcItems.length - 1; i >= 0; i--) {
                 if (btcItems[i].x === head.x && btcItems[i].y === head.y) {
-                    const item = btcItems[i];
-                    btcItems.splice(i, 1);
-                    ate = true;
-                    foodEaten++;
-
+                    const item = btcItems[i]; btcItems.splice(i, 1); ate = true; foodEaten++;
                     if (item.power) {
                         applyPowerup(item.power);
                     } else {
                         const val = item.type.value;
                         const mult = (activeBoosts.ruby && Date.now() < activeBoosts.ruby) ? 2 : 1;
-                        const prevScore = score;
-                        score += val * mult;
-                        sfxEat();
-                        vibe(val >= 1 ? [25, 20, 25] : 15);
-
+                        const prevScore = score; score += val * mult;
+                        sfxEat(); vibe(val >= 1 ? [25, 20, 25] : 15);
                         if (selectedMode === 'classic' || selectedMode === 'wrap') {
-                            const oldLvl = Math.floor(prevScore / 10);
-                            const newLvl = Math.floor(score / 10);
+                            const oldLvl = Math.floor(prevScore / 10), newLvl = Math.floor(score / 10);
                             if (newLvl > oldLvl) onLevelUp(newLvl);
                         }
                     }
-
-                    spawnBtc(1);
-                    if (btcItems.length < 4) spawnBtc(1);
-
+                    spawnBtc(1); if (btcItems.length < 4) spawnBtc(1);
                     updateHUD(); updateLevelBar();
+                    renderRequested = true;
                 }
             }
 
-            if (selectedMode === 'survival' && score >= SURVIVAL_TARGET) {
-                winGame();
-                return;
-            }
+            if (selectedMode === 'survival' && score >= SURVIVAL_TARGET) { winGame(); return false; }
 
             for (let i = boostsOnField.length - 1; i >= 0; i--) {
                 if (boostsOnField[i].x === head.x && boostsOnField[i].y === head.y) {
-                    const b = boostsOnField[i];
-                    const endTime = Date.now() + 10000;
+                    const b = boostsOnField[i], endTime = Date.now() + 10000;
                     if (b.type === 'ruby') activeBoosts.ruby = Math.max(activeBoosts.ruby || 0, endTime);
                     else activeBoosts.emerald = Math.max(activeBoosts.emerald || 0, endTime);
-                    boostsOnField.splice(i, 1);
-                    sfxBoost();
-                    vibe([20, 15, 20, 15, 30]);
-                    updateBoostIndicators();
+                    boostsOnField.splice(i, 1); sfxBoost(); vibe([20,15,20,15,30]);
+                    updateBoostIndicators(); renderRequested = true;
                 }
             }
 
@@ -1620,37 +1683,69 @@
             for (let i = boostsOnField.length - 1; i >= 0; i--) {
                 if (boostsOnField[i].expireAt <= now) boostsOnField.splice(i, 1);
             }
-
             if (now > nextBoostSpawnTime && boostsOnField.length < 2) {
-                spawnBoost();
-                nextBoostSpawnTime = now + 12000 + Math.random() * 10000;
+                spawnBoost(); nextBoostSpawnTime = now + 12000 + Math.random() * 10000;
+                renderRequested = true;
             }
 
             if (selectedMode === 'survival') {
-                const elapsed = (now - gameStartTime) / 1000;
-                const d = DIFFICULTIES[selectedDifficulty];
-                // скорость в "Выживании" растёт быстрее, чем в обычном режиме "стены"
+                const elapsed = (now - gameStartTime) / 1000, d = DIFFICULTIES[selectedDifficulty];
                 currentFps = Math.min(d.baseFps * speedMultiplier + elapsed * 0.14, d.cap * speedMultiplier * 1.3);
+                // Speed HUD changes slowly enough that it is cached by updateHUD().
                 updateHUD();
-
                 if (now > nextObstacleSpawnTime) {
                     spawnObstacles(1 + (Math.random() < 0.4 ? 1 : 0));
-                    nextObstacleSpawnTime = now + 30000 + Math.random() * 15000;
+                    nextObstacleSpawnTime = now + 30000 + Math.random() * 15000; renderRequested = true;
                 }
             }
 
             if (!ate) snake.pop();
+            if (activeBoosts.ruby && now > activeBoosts.ruby) { activeBoosts.ruby = null; renderRequested = true; }
+            if (activeBoosts.emerald && now > activeBoosts.emerald) { activeBoosts.emerald = null; renderRequested = true; }
+            if (activePowerups.slow && now > activePowerups.slow) { activePowerups.slow = null; renderRequested = true; }
+            renderRequested = true;
+            return true;
+        }
 
-            if (activeBoosts.ruby && now > activeBoosts.ruby) activeBoosts.ruby = null;
-            if (activeBoosts.emerald && now > activeBoosts.emerald) activeBoosts.emerald = null;
-            if (activePowerups.slow && now > activePowerups.slow) activePowerups.slow = null;
-
-            render();
-            updateBoostIndicators();
-
-
-            const delay = 1000 / effectiveFps(currentFps);
-            gameTickTimeout = setTimeout(gameTick, delay);
+        function stopGameLoop() {
+            gameLoopRunning = false;
+            if (gameFrameId !== null) { cancelAnimationFrame(gameFrameId); gameFrameId = null; }
+        }
+        function startGameLoop(delayMs = 0) {
+            stopGameLoop();
+            gameLoopRunning = true;
+            const now = performance.now();
+            lastGameFrameTime = now; lastRenderTime = now - (1000 / MAX_RENDER_FPS);
+            gameAccumulator = Math.max(0, delayMs);
+            let firstStepPending = delayMs === 0;
+            renderRequested = true;
+            const frame = (t) => {
+                if (!gameLoopRunning || gameState !== GAME_STATE.PLAYING || !gameRunning || paused) { gameFrameId = null; return; }
+                const dt = Math.min(MAX_FRAME_DELTA, Math.max(0, t - lastGameFrameTime));
+                lastGameFrameTime = t;
+                gameAccumulator += dt;
+                let steps = 0;
+                if (firstStepPending) {
+                    firstStepPending = false;
+                    if (!updateGame()) { gameFrameId = null; return; }
+                    renderRequested = true;
+                }
+                while (gameAccumulator >= 0 && steps < MAX_CATCHUP_STEPS) {
+                    const stepMs = 1000 / effectiveFps(currentFps);
+                    if (gameAccumulator < stepMs) break;
+                    if (!updateGame()) { gameFrameId = null; return; }
+                    gameAccumulator -= stepMs; steps++;
+                }
+                if (steps === MAX_CATCHUP_STEPS && gameAccumulator > 1000 / effectiveFps(currentFps)) {
+                    // Drop excess accumulated time instead of a death spiral after a WebView hitch.
+                    gameAccumulator = 0;
+                }
+                if (renderRequested || t - lastRenderTime >= 1000 / MAX_RENDER_FPS) {
+                    render(); lastRenderTime = t; renderRequested = false;
+                }
+                gameFrameId = requestAnimationFrame(frame);
+            };
+            gameFrameId = requestAnimationFrame(frame);
         }
 
         function effectiveFps(baseFps) {
@@ -1690,17 +1785,37 @@
         }
 
         // ==================== РЕНДЕРИНГ ====================
+        function invalidateGridCache() {
+            gridCacheKey = '';
+            gridCacheCanvas = null;
+        }
+        function drawGridCache() {
+            const key = COLS + 'x' + ROWS + ':' + GRID;
+            if (gridCacheCanvas && gridCacheKey === key) {
+                ctx.drawImage(gridCacheCanvas, 0, 0);
+                return;
+            }
+            const off = document.createElement('canvas');
+            off.width = canvas.width; off.height = canvas.height;
+            const oc = off.getContext('2d');
+            oc.strokeStyle = 'rgba(0,255,255,0.05)';
+            oc.lineWidth = 1;
+            oc.beginPath();
+            for (let i = 0; i <= COLS; i++) {
+                const x = i * GRID + 0.5; oc.moveTo(x, 0); oc.lineTo(x, off.height);
+            }
+            for (let j = 0; j <= ROWS; j++) {
+                const y = j * GRID + 0.5; oc.moveTo(0, y); oc.lineTo(off.width, y);
+            }
+            oc.stroke();
+            gridCacheCanvas = off; gridCacheKey = key;
+            ctx.drawImage(off, 0, 0);
+        }
         function render() {
             ctx.fillStyle = '#0a0a1a';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            ctx.strokeStyle = 'rgba(0,255,255,0.05)'; ctx.lineWidth = 1;
-            for (let i = 0; i <= COLS; i++) {
-                ctx.beginPath(); ctx.moveTo(i * GRID, 0); ctx.lineTo(i * GRID, canvas.height); ctx.stroke();
-            }
-            for (let j = 0; j <= ROWS; j++) {
-                ctx.beginPath(); ctx.moveTo(0, j * GRID); ctx.lineTo(canvas.width, j * GRID); ctx.stroke();
-            }
+            drawGridCache();
 
             if (selectedMode !== 'wrap') {
                 ctx.strokeStyle = '#ff3366';
@@ -1990,7 +2105,7 @@
             if (paused) {
                 gameState = GAME_STATE.PAUSED;
                 pauseStartTime = Date.now();
-                clearTimeout(gameTickTimeout);
+                stopGameLoop(); stopBoostUiLoop();
                 document.getElementById('pauseScreen').style.display = 'flex';
                 updateAudioButtons();
                 sfxClick();
@@ -2006,14 +2121,15 @@
                 boostsOnField.forEach(b => { b.expireAt += pd; });
                 document.getElementById('pauseScreen').style.display = 'none';
                 sfxClick();
-                gameTick();
+                startGameLoop();
+                startBoostUiLoop();
             }
         }
         function resumeGame() { if (gameRunning && paused) togglePause(); }
         function exitToMenu() {
             gameRunning = false; paused = false;
             gameState = GAME_STATE.MENU;
-            clearTimeout(gameTickTimeout);
+            stopGameLoop(); stopBoostUiLoop();
             document.getElementById('pauseScreen').style.display = 'none';
             document.getElementById('gameScreen').style.display = 'none';
             document.getElementById('startScreen').style.display = 'flex';
@@ -2026,7 +2142,7 @@
         function gameOver() {
             gameRunning = false; paused = false;
             gameState = GAME_STATE.GAMEOVER;
-            clearTimeout(gameTickTimeout);
+            stopGameLoop(); stopBoostUiLoop();
             const titleEl = document.querySelector('#gameOverScreen .go-title');
             titleEl.textContent = 'GAME OVER';
             titleEl.style.color = ''; titleEl.style.textShadow = '';
@@ -2050,7 +2166,7 @@
             // Победа в режиме "Выживание" — цель по очкам достигнута
             gameRunning = false; paused = false;
             gameState = GAME_STATE.GAMEOVER;
-            clearTimeout(gameTickTimeout);
+            stopGameLoop(); stopBoostUiLoop();
             const titleEl = document.querySelector('#gameOverScreen .go-title');
             titleEl.textContent = '🏆 ПОБЕДА!';
             titleEl.style.color = '#ffd700';
@@ -2231,15 +2347,12 @@
             document.getElementById('settingsModal').style.display = 'none';
             document.getElementById('gameScreen').style.display = 'flex';
             initGame(); canvas.focus();
-            clearTimeout(gameTickTimeout);
             sfxClick();
             render();
-            if (selectedMode === 'maze') {
-                // Даём игроку секунду осмотреть лабиринт перед стартом движения
-                gameTickTimeout = setTimeout(gameTick, 1000);
-            } else {
-                gameTick();
-            }
+            // Один и тот же rAF-цикл для всех режимов. Лабиринту оставляем
+            // прежнюю секундную паузу для осмотра перед первым шагом.
+            startGameLoop(selectedMode === 'maze' ? 1000 : 0);
+            startBoostUiLoop();
         }
 
         function setDirection(newDir) {
@@ -2354,44 +2467,48 @@
         }
 
         // ==================== ЗАГОТОВКА ПОД ГЕЙМПАД ====================
-        // Опрашиваем Gamepad API через requestAnimationFrame и транслируем
-        // D-pad/стик в те же вызовы setDirection(), что и клавиатура —
-        // геймпад логически эмулирует клавиатурный слой ввода.
-        // Кнопка Start/Options (индекс 9) ставит игру на паузу/снимает с паузы.
+        // Gamepad API is polled only while a controller is connected.
         let gamepadIndex = null;
         let gpPrevPause = false;
         const gamepadHintEl = document.getElementById('gamepadHint');
         window.addEventListener('gamepadconnected', (e) => {
-            gamepadIndex = e.gamepad.index;
+            gamepadIndex = e.gamepad.index; gpPrevPause = false;
             if (gamepadHintEl) gamepadHintEl.classList.add('visible');
+            startGamepadPolling();
         });
         window.addEventListener('gamepaddisconnected', (e) => {
             if (gamepadIndex === e.gamepad.index) gamepadIndex = null;
             if (gamepadHintEl) gamepadHintEl.classList.remove('visible');
+            if (gamepadIndex === null) stopGamepadPolling();
         });
-        function pollGamepad() {
-            if (gamepadIndex !== null && navigator.getGamepads) {
-                const gp = navigator.getGamepads()[gamepadIndex];
-                if (gp) {
-                    const AXIS_T = 0.5;
-                    if (gameRunning && !paused) {
-                        if (gp.buttons[12] && gp.buttons[12].pressed) setDirection(DIR_MAP.up);
-                        else if (gp.buttons[13] && gp.buttons[13].pressed) setDirection(DIR_MAP.down);
-                        else if (gp.buttons[14] && gp.buttons[14].pressed) setDirection(DIR_MAP.left);
-                        else if (gp.buttons[15] && gp.buttons[15].pressed) setDirection(DIR_MAP.right);
-                        else if (gp.axes[1] < -AXIS_T) setDirection(DIR_MAP.up);
-                        else if (gp.axes[1] > AXIS_T) setDirection(DIR_MAP.down);
-                        else if (gp.axes[0] < -AXIS_T) setDirection(DIR_MAP.left);
-                        else if (gp.axes[0] > AXIS_T) setDirection(DIR_MAP.right);
-                    }
-                    const pausePressed = !!(gp.buttons[9] && gp.buttons[9].pressed);
-                    if (pausePressed && !gpPrevPause && gameRunning) togglePause();
-                    gpPrevPause = pausePressed;
-                }
-            }
-            requestAnimationFrame(pollGamepad);
+        function stopGamepadPolling() {
+            if (gamepadTimer !== null) { clearTimeout(gamepadTimer); gamepadTimer = null; }
         }
-        requestAnimationFrame(pollGamepad);
+        function startGamepadPolling() {
+            stopGamepadPolling();
+            const poll = () => {
+                gamepadTimer = null;
+                if (gamepadIndex === null || !navigator.getGamepads) return;
+                const gp = navigator.getGamepads()[gamepadIndex];
+                if (!gp) { gamepadTimer = setTimeout(poll, 100); return; }
+                if (gameState === GAME_STATE.PLAYING && gameRunning && !paused) {
+                    const AXIS_T = 0.5;
+                    if (gp.buttons[12]?.pressed) setDirection(DIR_MAP.up);
+                    else if (gp.buttons[13]?.pressed) setDirection(DIR_MAP.down);
+                    else if (gp.buttons[14]?.pressed) setDirection(DIR_MAP.left);
+                    else if (gp.buttons[15]?.pressed) setDirection(DIR_MAP.right);
+                    else if ((gp.axes?.[1] || 0) < -AXIS_T) setDirection(DIR_MAP.up);
+                    else if ((gp.axes?.[1] || 0) > AXIS_T) setDirection(DIR_MAP.down);
+                    else if ((gp.axes?.[0] || 0) < -AXIS_T) setDirection(DIR_MAP.left);
+                    else if ((gp.axes?.[0] || 0) > AXIS_T) setDirection(DIR_MAP.right);
+                }
+                const pausePressed = !!gp.buttons?.[9]?.pressed;
+                if (pausePressed && !gpPrevPause && gameRunning) togglePause();
+                gpPrevPause = pausePressed;
+                gamepadTimer = setTimeout(poll, 50); // 20 Hz is sufficient for digital direction input
+            };
+            gamepadTimer = setTimeout(poll, 0);
+        }
 
         function unlockAudioOnce() {
             try {
@@ -2416,13 +2533,24 @@
         updateAudioButtons();
         try { bestBtc = parseFloat(localStorage.getItem(BEST_CLASSIC) || '0'); updateHUD(); } catch (e) {}
 
-        window.addEventListener('resize', resizeBgCanvas);
-        try { resizeBgCanvas(); initBgStars(); drawMascot(); drawGameLogo(); drawBackground(); bgLoop(); } catch (e) {}
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            if (resizeTimer !== null) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => { resizeTimer = null; resizeBgCanvas(); }, 100);
+        }, {passive:true});
+        try { resizeBgCanvas(); initBgStars(); drawMascot(); drawGameLogo(); renderBackgroundNow(); scheduleBackgroundLoop(); } catch (e) {}
         try { initTelegram(); } catch (e) {}
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && musicOn && !musicPlaying) {
-                try { startMusicLoop(); } catch (e) {}
+            if (document.hidden) {
+                if (gameState === GAME_STATE.PLAYING && gameRunning && !paused) togglePause();
+                stopBackgroundLoop();
+                stopGamepadPolling();
+                if (musicPlaying) { try { stopMusic(); } catch (e) {} }
+                return;
             }
+            scheduleBackgroundLoop();
+            if (gamepadIndex !== null) startGamepadPolling();
+            if (musicOn && !musicPlaying) { try { startMusicLoop(); } catch (e) {} }
         });
 </script>
 </body>
